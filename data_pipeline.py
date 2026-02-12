@@ -2,18 +2,28 @@ import pandas as pd
 import numpy as np
 import logging
 import os
+import json
 
-# Set up logging
+# Set up logging configuration
 logging.basicConfig(
     level=logging.INFO, 
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
+class DataValidator:
+    """Handles basic data validation for the pipeline."""
+    @staticmethod
+    def validate_columns(df, required_columns):
+        missing = [col for col in required_columns if col not in df.columns]
+        if missing:
+            raise ValueError(f"Missing required columns: {missing}")
+        return True
+
 def generate_dummy_data(file_path):
     """Generates a dummy CSV file for demonstration."""
     logging.info(f"Generating dummy data at {file_path}...")
     
-    np.random.seed(42) # For reproducibility
+    np.random.seed(42)
     data = {
         'transaction_id': range(1, 101),
         'date': pd.date_range(start='2023-01-01', periods=100, freq='D').strftime('%Y-%m-%d'),
@@ -24,51 +34,64 @@ def generate_dummy_data(file_path):
     
     df = pd.DataFrame(data)
     
-    # Add some nulls for cleaning demonstration
-    df.loc[np.random.choice(df.index, 5), 'amount'] = np.nan
+    # Introduce some data quality issues: Nulls and outliers
+    df.loc[np.random.choice(df.index, 8), 'amount'] = np.nan
+    df.loc[0, 'amount'] = 50000.0  # An intentional outlier
     
     df.to_csv(file_path, index=False)
     logging.info("Dummy data generated successfully.")
 
-def run_pipeline(input_file, output_file):
+def run_data_quality_report(df):
+    """Performs basic data quality checks and returns a report."""
+    logging.info("Running Data Quality Checks...")
+    report = {
+        'total_rows': len(df),
+        'null_counts': df.isnull().sum().to_dict(),
+        'null_percentages': (df.isnull().sum() / len(df) * 100).to_dict(),
+        'amount_outliers': len(df[df['amount'] > 10000]) # Basic outlier detection
+    }
+    
+    for col, pct in report['null_percentages'].items():
+        if pct > 0:
+            logging.warning(f"Data Quality Alert: Column '{col}' has {pct:.1f}% null values.")
+            
+    return report
+
+def run_pipeline(input_file, output_base_name):
     """
-    Simple E-T-L Pipeline:
-    Extract: Read CSV
-    Transform: Date conversion, Data cleaning (NaNs), Aggregations
-    Load: Write summary CSV
+    Enhanced E-T-L Pipeline with Validation and Quality Checks.
     """
     try:
         # 1. EXTRACT
         logging.info(f"EXTRACT: Reading data from {input_file}...")
         df = pd.read_csv(input_file)
         
-        # 2. TRANSFORM
+        # 2. VALIDATE
+        DataValidator.validate_columns(df, ['transaction_id', 'date', 'amount', 'product_category'])
+        
+        # 3. TRANSFORM
         logging.info("TRANSFORM: Starting data transformations...")
         
-        # Convert date column to datetime objects
+        # Quality Check Step
+        dq_report = run_data_quality_report(df)
+        
+        # Convert date column
         df['date'] = pd.to_datetime(df['date'])
         
-        # Clean: Handle missing values in 'amount'
-        missing_count = df['amount'].isna().sum()
-        if missing_count > 0:
-            logging.warning(f"Found {missing_count} missing values in 'amount'. Filling with column mean.")
-            mean_amount = df['amount'].mean()
-            df['amount'] = df['amount'].fillna(mean_amount)
+        # Clean: Handle missing values in 'amount' using median (more robust to outliers)
+        if dq_report['null_counts']['amount'] > 0:
+            median_val = df['amount'].median()
+            logging.info(f"Filling nulls in 'amount' with median value: {median_val}")
+            df['amount'] = df['amount'].fillna(median_val)
             
-        # Feature Engineering: Extract month from date
+        # Process Category Metrics
         df['month'] = df['date'].dt.strftime('%Y-%m')
         
-        # Aggregate: Performance summary by category
-        # - Total Revenue
-        # - Average Transaction Value
-        # - Number of Transactions
-        # - Unique Customers reached
         agg_df = df.groupby('product_category').agg({
             'amount': ['sum', 'mean', 'count'],
             'customer_id': 'nunique'
         }).reset_index()
         
-        # Flatten Multi-index columns
         agg_df.columns = [
             'product_category', 
             'total_revenue', 
@@ -77,41 +100,35 @@ def run_pipeline(input_file, output_file):
             'unique_customers'
         ]
         
-        # Round numeric values for cleanliness
-        agg_df = agg_df.round(2)
+        # Load Final Summary
+        summary = agg_df.round(2).sort_values(by='total_revenue', ascending=False)
         
-        # Filter: Keep only high-performing categories (Revenue > 5000 as example)
-        # Note: With 100 rows and ~500 avg, total is ~50k. Total categories=5, so ~10k each.
-        threshold = 10000
-        filtered_df = agg_df[agg_df['total_revenue'] > threshold].sort_values(by='total_revenue', ascending=False)
+        # 4. LOAD (Multi-format)
+        logging.info(f"LOAD: Writing results to {output_base_name} formats...")
         
-        logging.info(f"TRANSFORM: Processing complete. Filtered {len(agg_df)} categories down to {len(filtered_df)}.")
+        # Save as CSV
+        summary.to_csv(f"{output_base_name}.csv", index=False)
         
-        # 3. LOAD
-        logging.info(f"LOAD: Writing results to {output_file}...")
-        filtered_df.to_csv(output_file, index=False)
+        # Save as JSON (Pretty printed)
+        summary.to_json(f"{output_base_name}.json", orient='records', indent=4)
+        
         logging.info("Pipeline execution finished successfully.")
-        
-        return filtered_df
+        return summary
 
     except Exception as e:
-        logging.error(f"Pipeline failed during execution: {str(e)}")
+        logging.error(f"Pipeline failed: {str(e)}")
         raise
 
 if __name__ == "__main__":
-    # Define file paths
     input_path = "raw_transactions.csv"
-    output_path = "category_performance_report.csv"
+    output_base = "enhanced_category_report"
     
-    # Step 0: Ensure we have data to work with
     if not os.path.exists(input_path):
         generate_dummy_data(input_path)
     
-    # Step 1: Run the ETL pipeline
-    report = run_pipeline(input_path, output_path)
+    final_report = run_pipeline(input_path, output_base)
     
-    # Preview the results
-    print("\n--- DATA ENGINEERING PIPELINE SUMMARY ---")
-    print(report)
-    print("------------------------------------------")
-    print(f"Summary saved to: {os.path.abspath(output_path)}")
+    print("\n--- ENHANCED PIPELINE SUMMARY ---")
+    print(final_report)
+    print("---------------------------------")
+
